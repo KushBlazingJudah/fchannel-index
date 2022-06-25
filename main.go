@@ -44,13 +44,6 @@ func IndexInstances(queue util.Queue) ([]string, error) {
 			return index, err
 		}
 
-		re := regexp.MustCompile(`https?://[^/]*`)
-		domain := re.FindString(cur)
-
-		if indexed := CheckIfIndex(index, domain); !indexed {
-			index = append(index, domain)
-		}
-
 		following, err := GetInstances(cur + "/following")
 
 		for _, e := range following {
@@ -67,6 +60,13 @@ func IndexInstances(queue util.Queue) ([]string, error) {
 				alreadyChecked = append(alreadyChecked, e)
 				queue.Enqueue(e)
 			}
+		}
+
+		re := regexp.MustCompile(`https?://[^/]*`)
+		domain := re.FindString(cur)
+
+		if indexed := CheckIfIndex(index, domain); (len(followers) > 0 || len(following) > 0) && !indexed {
+			index = append(index, domain)
 		}
 	}
 
