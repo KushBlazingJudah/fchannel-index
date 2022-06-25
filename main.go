@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"time"
 
@@ -21,12 +22,18 @@ func main() {
 
 	queue.Enqueue("https://fchan.xyz")
 
-	if err := IndexInstances(queue); err != nil {
+	var err error
+	var index []string
+
+	if index, err = IndexInstances(queue); err != nil {
 		fmt.Println(err)
+		return
 	}
+
+	CreateHTMLIndex(index)
 }
 
-func IndexInstances(queue util.Queue) error {
+func IndexInstances(queue util.Queue) ([]string, error) {
 	var index []string
 	var alreadyChecked []string
 
@@ -34,7 +41,7 @@ func IndexInstances(queue util.Queue) error {
 		cur, err := queue.Dequeue()
 
 		if err != nil {
-			return err
+			return index, err
 		}
 
 		re := regexp.MustCompile(`https?://[^/]*`)
@@ -63,11 +70,7 @@ func IndexInstances(queue util.Queue) error {
 		}
 	}
 
-	for _, e := range index {
-		fmt.Println(e)
-	}
-
-	return nil
+	return index, nil
 }
 
 func GetInstances(route string) ([]string, error) {
@@ -78,6 +81,8 @@ func GetInstances(route string) ([]string, error) {
 	if err != nil {
 		return instances, err
 	}
+
+	req.Header.Set("User-Agent", "FChannel-Index-Scan")
 
 	resp, err := RouteProxy(req)
 
@@ -144,4 +149,29 @@ func GetPathProxyType(path string) string {
 	}
 
 	return "clearnet"
+}
+
+func CreateHTMLIndex(index []string) error {
+	file, err := os.Create("instance-index.html")
+
+	if err != nil {
+		return err
+	}
+
+	var text string
+
+	text += fmt.Sprintln("<div style=\"max-width: 800px; margin: 0 auto;\">")
+	text += fmt.Sprintln("<h1 style=\"text-align: center;\"> Current known instances</h1>")
+	text += fmt.Sprintln("<ul style=\"list-style-type: none;\">")
+
+	for _, e := range index {
+		text += fmt.Sprintf("<li><a href=\"%s\">%s</a></li>\n", e, e)
+	}
+
+	text += fmt.Sprintln("</ul>")
+	text += fmt.Sprintln("</div>")
+
+	_, err = file.WriteString(text)
+
+	return err
 }
