@@ -12,14 +12,12 @@ import (
 	"time"
 	"sync"
 	"strings"
+	"flag"
 
 	"git.fchannel.org/fchannel-index/activitypub"
 )
 
-// Set to nil if you don't want to use the Tor proxy
-var TorProxy = http.ProxyURL(&url.URL{Scheme: "socks5", Host: "127.0.0.1:9050"})
-
-// Set to true if you always want to use Tor
+var TorProxy func (*http.Request) (*url.URL, error) // Signature of http.ProxyURL
 var ForceTor bool = true
 
 type proxy uint8
@@ -35,10 +33,27 @@ type state struct {
 }
 
 func main() {
+	flag.BoolVar(&ForceTor, "forcetor", false, "force all connections to go through Tor")
+	proxy := flag.String("tor", "127.0.0.1:9050", "tor proxy address")
+	flag.Parse()
+
+	if *proxy != "" {
+		TorProxy = http.ProxyURL(&url.URL{Scheme: "socks5", Host: *proxy})
+	} else {
+		log.Printf("turning force tor off since proxy is empty")
+		ForceTor = false
+	}
+
+	log.Printf("starting crawl (force tor: %t)", ForceTor)
+
 	s := state{}
 	s.seen = map[string]struct{}{}
+	then := time.Now()
+	s.Add(1)
 	s.Walk("https://fchan.xyz", 0)
 	s.Wait()
+
+	log.Print("done crawl in ", time.Since(then))
 
 	if err := CreateHTMLIndex(s.seen); err != nil {
 		panic(err)
@@ -46,7 +61,6 @@ func main() {
 }
 
 func (s *state) Walk(cur string, depth int) {
-	s.Add(1)
 	defer s.Done()
 	s.Lock()
 	s.seen[cur] = struct{}{}
@@ -71,6 +85,7 @@ func (s *state) Walk(cur string, depth int) {
 		e = strings.TrimPrefix(e, " ")
 		if _, wasSeen := s.seen[e]; !wasSeen {
 			s.seen[e] = struct{}{}
+			s.Add(1)
 			go s.Walk(e, depth+1)
 		}
 	}
@@ -112,6 +127,10 @@ func GetInstances(route string) ([]string, error) {
 
 func RouteProxy(req *http.Request) (*http.Response, error) {
 	if ForceTor || GetPathProxyType(req.URL.Host) == tor {
+		if TorProxy == nil {
+			return nil, fmt.Errorf("no tor proxy configured")
+		}
+
 		log.Printf("tor request: %s", req.URL)
 		proxyTransport := &http.Transport{Proxy: TorProxy}
 		client := &http.Client{Transport: proxyTransport, Timeout: time.Second * 15}
