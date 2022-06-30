@@ -1,10 +1,10 @@
 package main
 
 import (
-	"container/list"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,98 +12,80 @@ import (
 	"time"
 
 	"git.fchannel.org/fchannel-index/activitypub"
-	"git.fchannel.org/fchannel-index/util"
 )
 
-var TorProxy = "127.0.0.1:9050"
+// Set to nil if you don't want to use the Tor proxy
+var TorProxy = http.ProxyURL(&url.URL{Scheme: "socks5", Host: "127.0.0.1:9050"})
+
+// Set to true if you always want to use Tor
+var ForceTor bool = true
+
+type proxy uint8
+const (
+	tor proxy = iota
+	clear
+)
 
 func main() {
-	var queue = util.Queue{Queue: list.New()}
+	index := Walk("https://fchan.xyz", map[string]struct{}{}, 0)
 
-	queue.Enqueue("https://fchan.xyz")
-
-	var err error
-	var index []string
-
-	if index, err = IndexInstances(queue); err != nil {
-		fmt.Println(err)
-		return
+	if err := CreateHTMLIndex(index); err != nil {
+		panic(err)
 	}
-
-	CreateHTMLIndex(index)
 }
 
-func IndexInstances(queue util.Queue) ([]string, error) {
-	var index []string
-	var alreadyChecked []string
+func Walk(cur string, seen map[string]struct{}, depth int) []string {
+	log.Printf("walking %s (depth: %d)", cur, depth)
+	index := []string{cur}
+	check, err := GetInstances(cur + "/following")
+	if err != nil {
+		log.Printf("fatal error on %s: %s", cur, err)
+		return nil
+	}
 
-	for queue.Len() > 0 {
-		cur, err := queue.Dequeue()
+	followers, err := GetInstances(cur + "/followers")
+	if err != nil {
+		log.Printf("non-fatal error on %s: %s", cur, err)
+	}
 
-		if err != nil {
-			return index, err
-		}
+	check = append(check, followers...)
 
-		following, err := GetInstances(cur + "/following")
-
-		for _, e := range following {
-			if indexed := CheckIfIndex(alreadyChecked, e); !indexed {
-				alreadyChecked = append(alreadyChecked, e)
-				queue.Enqueue(e)
-			}
-		}
-
-		followers, err := GetInstances(cur + "/followers")
-
-		for _, e := range followers {
-			if indexed := CheckIfIndex(alreadyChecked, e); !indexed {
-				alreadyChecked = append(alreadyChecked, e)
-				queue.Enqueue(e)
-			}
-		}
-
-		re := regexp.MustCompile(`https?://[^/]*`)
-		domain := re.FindString(cur)
-
-		if indexed := CheckIfIndex(index, domain); (len(followers) > 0 || len(following) > 0) && !indexed {
-			index = append(index, domain)
+	for _, e := range check {
+		if _, wasSeen := seen[e]; !wasSeen {
+			seen[cur] = struct{}{}
+			index = append(index, Walk(e, seen, depth+1)...)
 		}
 	}
 
-	return index, nil
+	return index
 }
 
 func GetInstances(route string) ([]string, error) {
-	var instances []string
-
 	req, err := http.NewRequest("GET", route, nil)
-
 	if err != nil {
-		return instances, err
+		return nil, err
 	}
 
 	req.Header.Set("User-Agent", "FChannel-Index-Scan")
 
 	resp, err := RouteProxy(req)
-
 	if err != nil {
-		return instances, err
+		return nil, err
 	}
-
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
-
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return instances, err
+		return nil, err
 	}
 
 	var respCollection activitypub.Collection
 
 	if err := json.Unmarshal(body, &respCollection); err != nil {
-		return instances, err
+		return nil, err
 	}
 
+	var instances []string
 	for _, e := range respCollection.Items {
 		instances = append(instances, e.Id)
 	}
@@ -111,67 +93,50 @@ func GetInstances(route string) ([]string, error) {
 	return instances, nil
 }
 
-func CheckIfIndex(index []string, value string) bool {
-	for _, e := range index {
-		if e == value {
-			return true
-		}
-	}
-	return false
-}
-
 func RouteProxy(req *http.Request) (*http.Response, error) {
-
-	var proxyType = GetPathProxyType(req.URL.Host)
-
-	if proxyType == "tor" {
-		proxyUrl, err := url.Parse("socks5://" + TorProxy)
-
-		if err != nil {
-			return nil, err
-		}
-
-		proxyTransport := &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+	if ForceTor || GetPathProxyType(req.URL.Host) == tor {
+		log.Printf("tor request: %s", req.URL)
+		proxyTransport := &http.Transport{Proxy: TorProxy}
 		client := &http.Client{Transport: proxyTransport, Timeout: time.Second * 15}
 		return client.Do(req)
 	}
 
+	log.Printf("request: %s", req.URL)
 	return http.DefaultClient.Do(req)
 }
 
-func GetPathProxyType(path string) string {
-	if TorProxy != "" {
+func GetPathProxyType(path string) proxy {
+	if TorProxy != nil {
 		re := regexp.MustCompile(`(http://|http://)?(www.)?\w+\.onion`)
 		onion := re.MatchString(path)
 		if onion {
-			return "tor"
+			return tor
 		}
 	}
 
-	return "clearnet"
+	return clear
 }
 
 func CreateHTMLIndex(index []string) error {
 	file, err := os.Create("instance-index.html")
-
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
-	var text string
-
-	text += fmt.Sprintln("<div style=\"max-width: 800px; margin: 0 auto;\">")
-	text += fmt.Sprintln("<h1 style=\"text-align: center;\"> Current known instances</h1>")
-	text += fmt.Sprintln("<ul style=\"list-style-type: none;\">")
-
-	for _, e := range index {
-		text += fmt.Sprintf("<li><a href=\"%s\">%s</a></li>\n", e, e)
+	if _, err = file.WriteString(`<div style="max-width: 800px; margin: 0 auto;">
+<h1 style="text-align: center;"> Current known instances</h1>
+<ul style="list-style-type: none;">
+`); err != nil {
+		return err
 	}
 
-	text += fmt.Sprintln("</ul>")
-	text += fmt.Sprintln("</div>")
+	for _, e := range index {
+		if _, err = file.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>\n", e, e)); err != nil {
+			panic(err)
+		}
+	}
 
-	_, err = file.WriteString(text)
-
+	_, err = file.WriteString("</ul>\n</div>\n")
 	return err
 }
