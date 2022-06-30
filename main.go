@@ -10,6 +10,8 @@ import (
 	"os"
 	"regexp"
 	"time"
+	"sync"
+	"strings"
 
 	"git.fchannel.org/fchannel-index/activitypub"
 )
@@ -26,21 +28,35 @@ const (
 	clear
 )
 
-func main() {
-	index := Walk("https://fchan.xyz", map[string]struct{}{}, 0)
+type state struct {
+	sync.WaitGroup
+	sync.Mutex
+	seen map[string]struct{}
+}
 
-	if err := CreateHTMLIndex(index); err != nil {
+func main() {
+	s := state{}
+	s.seen = map[string]struct{}{}
+	s.Walk("https://fchan.xyz", 0)
+	s.Wait()
+
+	if err := CreateHTMLIndex(s.seen); err != nil {
 		panic(err)
 	}
 }
 
-func Walk(cur string, seen map[string]struct{}, depth int) []string {
+func (s *state) Walk(cur string, depth int) {
+	s.Add(1)
+	defer s.Done()
+	s.Lock()
+	s.seen[cur] = struct{}{}
+	s.Unlock()
+
 	log.Printf("walking %s (depth: %d)", cur, depth)
-	index := []string{cur}
 	check, err := GetInstances(cur + "/following")
 	if err != nil {
 		log.Printf("fatal error on %s: %s", cur, err)
-		return nil
+		return
 	}
 
 	followers, err := GetInstances(cur + "/followers")
@@ -50,14 +66,15 @@ func Walk(cur string, seen map[string]struct{}, depth int) []string {
 
 	check = append(check, followers...)
 
+	s.Lock()
 	for _, e := range check {
-		if _, wasSeen := seen[e]; !wasSeen {
-			seen[cur] = struct{}{}
-			index = append(index, Walk(e, seen, depth+1)...)
+		e = strings.TrimPrefix(e, " ")
+		if _, wasSeen := s.seen[e]; !wasSeen {
+			s.seen[e] = struct{}{}
+			go s.Walk(e, depth+1)
 		}
 	}
-
-	return index
+	s.Unlock()
 }
 
 func GetInstances(route string) ([]string, error) {
@@ -117,7 +134,7 @@ func GetPathProxyType(path string) proxy {
 	return clear
 }
 
-func CreateHTMLIndex(index []string) error {
+func CreateHTMLIndex(index map[string]struct{}) error {
 	file, err := os.Create("instance-index.html")
 	if err != nil {
 		return err
@@ -125,13 +142,21 @@ func CreateHTMLIndex(index []string) error {
 	defer file.Close()
 
 	if _, err = file.WriteString(`<div style="max-width: 800px; margin: 0 auto;">
-<h1 style="text-align: center;"> Current known instances</h1>
+<h1 style="text-align: center;">Current known instances</h1>
 <ul style="list-style-type: none;">
 `); err != nil {
 		return err
 	}
 
-	for _, e := range index {
+	instances := map[string]struct{}{}
+
+	for e := range index {
+		re := regexp.MustCompile(`https?://[^/]*`)
+		domain := re.FindString(e)
+		instances[domain] = struct{}{}
+	}
+
+	for e := range instances {
 		if _, err = file.WriteString(fmt.Sprintf("<li><a href=\"%s\">%s</a></li>\n", e, e)); err != nil {
 			panic(err)
 		}
